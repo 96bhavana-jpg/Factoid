@@ -720,7 +720,7 @@ const MEDALS=[
  {id:"all",t:"Every section",i:"◈",f:()=>SECS.every(x=>CARDS.some(c=>c.sec===x.id&&D.cards[c.id]&&D.cards[c.id].right>0))}
 ];
 
-let D={cards:{},off:[],streak:0,best:0,last:null,points:0,correct:0,perfect:0,bestRun:0,medals:[],stars:[],theme:"auto",key:"",model:"",chats:{},custom:[]};
+let D={cards:{},off:[],streak:0,best:0,last:null,points:0,correct:0,perfect:0,bestRun:0,medals:[],stars:[],theme:"auto",prov:"gemini",key:"",model:"",gkey:"",gmodel:"",chats:{},custom:[]};
 let view="today",sess=null,fSec="all",fQ="",fStar=false,openId=null;
 
 const day=()=>{const d=new Date();return Math.floor((d-new Date(d.getFullYear(),0,0))/864e5)+d.getFullYear()*1000;};
@@ -781,7 +781,39 @@ const AI=(()=>{
      ns=await window.claude.use("sample"); }catch(e){}
    settled=true;
  })();
+ const prov=()=>D.prov==="claude"?"claude":"gemini";
+ const myKey=()=>((prov()==="claude"?D.key:D.gkey)||"").trim();
+ const GBASE="https://generativelanguage.googleapis.com/v1beta/models/";
+ function gerr(status,msg){
+   const e=new Error(msg||("HTTP "+status));
+   e.code = status===400&&/API key/i.test(msg||"") ? "bad_key"
+          : status===401||status===403 ? "bad_key"
+          : status===429 ? "rate_limited" : "http";
+   return e;
+ }
+ async function gemini(body,model){
+   const key=myKey();
+   if(!key){const e=new Error("no key");e.code="no_key";throw e;}
+   const r=await fetch(GBASE+(model||(D.gmodel||"gemini-2.5-flash").trim())+":generateContent",{
+     method:"POST",
+     headers:{"content-type":"application/json","x-goog-api-key":key},
+     body:JSON.stringify(body)});
+   if(!r.ok){let m="";try{m=(await r.json()).error.message;}catch(e){}throw gerr(r.status,m);}
+   const j=await r.json();
+   const c=(j.candidates||[])[0];
+   const t=(((c||{}).content||{}).parts||[]).map(x=>x.text||"").join("").trim();
+   if(!t){const e=new Error("empty");e.code="empty";throw e;}
+   return t;
+ }
  async function viaKey(turns,sys,onText){
+   if(prov()==="gemini"){
+     const t=await gemini({
+       system_instruction:{parts:[{text:sys}]},
+       contents:turns.map(x=>({role:x.role==="assistant"?"model":"user",parts:[{text:x.content}]})),
+       generationConfig:{maxOutputTokens:900}});
+     if(onText)onText(t);
+     return t;
+   }
    const key=(D.key||"").trim();
    if(!key){const e=new Error("no key");e.code="no_key";throw e;}
    const r=await fetch("https://api.anthropic.com/v1/messages",{
@@ -800,11 +832,30 @@ const AI=(()=>{
  }
  return{
   async host(){await ready;return !!ns;},
-  async usable(){await ready;return !!ns||!!(D.key||"").trim();},
+  async usable(){await ready;return !!ns||!!myKey();},
   async askJSON(prompt,search){
     await ready;
     if(ns&&!search){
       return await ns.json(prompt,{modelTier:"default"});
+    }
+    if(prov()==="gemini"){
+      const gb={contents:[{role:"user",parts:[{text:prompt}]}],
+        generationConfig:{maxOutputTokens:8000}};
+      if(search)gb.tools=[{google_search:{}}];
+      else gb.generationConfig.responseMimeType="application/json";
+      let t;
+      try{ t=await gemini(gb); }
+      catch(e){
+        if(search&&e.code==="http"){
+          const gb2={contents:[{role:"user",parts:[{text:prompt}]}],
+            generationConfig:{maxOutputTokens:8000,responseMimeType:"application/json"}};
+          t=await gemini(gb2);
+        } else throw e;
+      }
+      t=t.replace(/^[\s\S]*?```(?:json)?/,"").replace(/```[\s\S]*$/,"").trim();
+      const i=t.indexOf("["),k=t.lastIndexOf("]");
+      if(i<0||k<i){const e=new Error("no json");e.code="bad_json";throw e;}
+      return JSON.parse(t.slice(i,k+1));
     }
     const key=(D.key||"").trim();
     if(!key){const e=new Error("no key");e.code=search?"no_key_search":"no_key";throw e;}
@@ -870,7 +921,7 @@ function mountAI(c,slot){
   inp.onkeydown=e=>{if(e.key==="Enter")send(inp.value);};
   AI.usable().then(ok=>{
    const h=el.querySelector("#ai-hint");
-   if(!ok&&h)h.textContent="Add a Claude API key under Progress to ask follow-up questions here.";
+   if(!ok&&h)h.textContent="Add a free API key under Progress to ask follow-up questions here.";
   });
  };
  async function send(text){
@@ -897,7 +948,7 @@ function mountAI(c,slot){
    turns.pop();D.chats[c.id]=turns;
    bub.remove();go.disabled=false;
    hint.textContent =
-     e&&e.code==="no_key" ? "Add a Claude API key under Progress to ask follow-up questions here."
+     e&&e.code==="no_key" ? "Add an API key under Progress to ask follow-up questions here."
      : e&&e.code==="bad_key" ? "That API key was rejected. Check it under Progress."
      : e&&e.code==="not_granted" ? "This view isn't allowed to ask Claude."
      : e&&e.code==="rate_limited" ? "Too many questions at once — try again shortly."
@@ -1013,12 +1064,12 @@ function mountGen(){
    }
   }catch(e){
    genMsg = e&&e.code==="no_key_search"
-     ? "Searching the news needs your own Claude API key — add one under Progress. It only works outside Claude."
-     : e&&e.code==="no_key" ? "Add a Claude API key under Progress to write new questions."
+     ? "Searching the news needs your own API key — add one under Progress. It only works outside Claude."
+     : e&&e.code==="no_key" ? "Add an API key under Progress to write new questions."
      : e&&e.code==="bad_key" ? "That API key was rejected. Check it under Progress."
      : e&&e.code==="bad_json" ? "The reply came back malformed. Try again."
      : e&&e.code==="not_granted" ? "This view isn't allowed to ask Claude."
-     : e&&e.code==="rate_limited" ? "Too many requests just now. Try again shortly."
+     : e&&e.code==="rate_limited" ? "Hit the free tier's rate limit. Wait a minute and try again."
      : "That didn't work. Try again.";
   }
   genBusy=false;mountGen();
@@ -1217,21 +1268,51 @@ function vProgress(){
  const KZ=document.getElementById("keyzone");
  AI.host().then(h=>{
   if(h){KZ.innerHTML='<p class="note">Follow-up questions are answered through Claude in this view. Nothing to set up.</p>';return;}
-  KZ.innerHTML='<p class="note">To ask follow-up questions under each answer, paste an Anthropic API key from console.anthropic.com. It is kept in this browser only, never uploaded, and never written into the page file.</p>'+
-   '<div class="keybox"><input id="k" type="password" placeholder="sk-ant-..." value="'+esc(D.key||"")+'">'+
-   '<input id="m" placeholder="Model (claude-sonnet-5)" value="'+esc(D.model||"")+'">'+
-   '<button class="btn" id="ks" style="margin-top:0">Save key</button></div>';
-  KZ.querySelector("#ks").onclick=()=>{
-   D.key=KZ.querySelector("#k").value.trim();
-   D.model=KZ.querySelector("#m").value.trim();
-   save();
-   KZ.querySelector("#ks").textContent=D.key?"Saved":"Cleared";
+  const drawKey=()=>{
+   const gem=D.prov!=="claude";
+   KZ.innerHTML=
+    '<div class="starters" style="margin-bottom:10px">'+
+     '<button class="starter'+(gem?" pick":"")+'" data-p="gemini">Gemini — free</button>'+
+     '<button class="starter'+(gem?"":" pick")+'" data-p="claude">Claude — paid</button></div>'+
+    '<p class="note">'+(gem
+      ? 'Free, and no card needed. Go to aistudio.google.com, sign in with a Google account, choose Get API key, and paste it below. The free tier allows a few requests a minute, which is plenty here. Google may use free-tier prompts to improve its models, so keep anything confidential out of the follow-up box.'
+      : 'Paid by usage, a fraction of a penny per question. Create a key at console.anthropic.com and add a little credit first.')+
+     ' The key is kept in this browser only — never uploaded, never written into the page file.</p>'+
+    '<div class="keybox">'+
+     (gem
+      ? '<input id="gk" type="password" placeholder="AIza..." value="'+esc(D.gkey||"")+'">'+
+        '<input id="gm" placeholder="Model (gemini-2.5-flash)" value="'+esc(D.gmodel||"")+'">'
+      : '<input id="k" type="password" placeholder="sk-ant-..." value="'+esc(D.key||"")+'">'+
+        '<input id="m" placeholder="Model (claude-sonnet-5)" value="'+esc(D.model||"")+'">')+
+     '<button class="btn" id="ks" style="margin-top:0">Save key</button>'+
+     '<p class="hint" id="kmsg"></p></div>';
+   KZ.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{D.prov=b.dataset.p;save();drawKey();});
+   KZ.querySelector("#ks").onclick=async()=>{
+    if(gem){D.gkey=KZ.querySelector("#gk").value.trim();D.gmodel=KZ.querySelector("#gm").value.trim();}
+    else{D.key=KZ.querySelector("#k").value.trim();D.model=KZ.querySelector("#m").value.trim();}
+    await save();
+    const msg=KZ.querySelector("#kmsg"),btn=KZ.querySelector("#ks");
+    btn.textContent="Saved";
+    const has=gem?D.gkey:D.key;
+    if(!has){msg.textContent="Cleared.";return;}
+    msg.textContent="Checking the key…";
+    try{
+     await AI.ask([{role:"user",content:"Reply with the single word: ready"}],
+       "You are a connection test. Reply with one word.");
+     msg.textContent="Working. Follow-up questions are switched on.";
+    }catch(e){
+     msg.textContent = e&&e.code==="bad_key" ? "That key was rejected — check it and try again."
+       : e&&e.code==="rate_limited" ? "Key accepted, but the free tier is busy. Try a question in a minute."
+       : "Saved, but the test call failed. Check the model name, or try again shortly.";
+    }
+   };
   };
+  drawKey();
  });
  document.getElementById("rs").onclick=()=>{
   if(confirm("Clear every box, point and mark? This cannot be undone.")){
-   const t=D.theme,k=D.key,m=D.model,cu=D.custom||[];
-   D={cards:{},off:[],streak:0,best:0,last:null,points:0,correct:0,perfect:0,bestRun:0,medals:[],stars:[],theme:t,key:k,model:m,chats:{},custom:cu};
+   const t=D.theme,k=D.key,m=D.model,pv=D.prov,gk=D.gkey,gm=D.gmodel,cu=D.custom||[];
+   D={cards:{},off:[],streak:0,best:0,last:null,points:0,correct:0,perfect:0,bestRun:0,medals:[],stars:[],theme:t,prov:pv,key:k,model:m,gkey:gk,gmodel:gm,chats:{},custom:cu};
    makeCards();
    save();render();}};
 }
