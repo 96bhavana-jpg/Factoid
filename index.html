@@ -783,18 +783,47 @@ const AI=(()=>{
  })();
  const prov=()=>D.prov==="claude"?"claude":"gemini";
  const myKey=()=>((prov()==="claude"?D.key:D.gkey)||"").trim();
- const GBASE="https://generativelanguage.googleapis.com/v1beta/models/";
+ const GBASE="https://generativelanguage.googleapis.com/v1beta/";
+ // fallbacks, newest first — Google retires model names, so the app also asks the key what it can run
+ const GFALL=["gemini-3.8-flash","gemini-3.1-flash-lite","gemini-flash-latest",
+              "gemini-3-flash-preview","gemini-2.5-flash","gemini-2.5-flash-lite"];
  function gerr(status,msg){
    const e=new Error(msg||("HTTP "+status));
-   e.code = status===400&&/API key/i.test(msg||"") ? "bad_key"
+   const m=msg||"";
+   e.code = /API key not valid|API_KEY_INVALID/i.test(m) ? "bad_key"
           : status===401||status===403 ? "bad_key"
-          : status===429 ? "rate_limited" : "http";
+          : status===429 ? "rate_limited"
+          : status===404||/not found|not supported|unsupported|does not exist/i.test(m) ? "model"
+          : "http";
    return e;
  }
- async function gemini(body,model){
+ // ask the key which models it may actually use, and pick a sensible flash one
+ async function gmodels(){
    const key=myKey();
    if(!key){const e=new Error("no key");e.code="no_key";throw e;}
-   const r=await fetch(GBASE+(model||(D.gmodel||"gemini-2.5-flash").trim())+":generateContent",{
+   const r=await fetch(GBASE+"models?pageSize=200",{headers:{"x-goog-api-key":key}});
+   if(!r.ok){let m="";try{m=(await r.json()).error.message;}catch(e){}throw gerr(r.status,m);}
+   const j=await r.json();
+   return (j.models||[])
+     .filter(m=>(m.supportedGenerationMethods||[]).includes("generateContent"))
+     .map(m=>String(m.name||"").replace(/^models\//,""))
+     .filter(n=>/flash/i.test(n) && !/image|tts|audio|live|embed|vision|thinking|omni/i.test(n));
+ }
+ function gpick(names){
+   const score=n=>{
+     let s=0;
+     const v=(n.match(/gemini-(\d+(?:\.\d+)?)/)||[])[1];
+     if(v)s+=parseFloat(v)*100;
+     if(/lite/i.test(n))s+=5;            // lite has the friendliest free limits
+     if(/preview|exp/i.test(n))s-=40;    // prefer stable
+     if(/latest/i.test(n))s-=10;
+     if(/-\d{2}-\d{2}$/.test(n))s-=20;   // prefer the undated alias
+     return s;
+   };
+   return names.slice().sort((a,b)=>score(b)-score(a))[0];
+ }
+ async function gcall(body,model,key){
+   const r=await fetch(GBASE+"models/"+model+":generateContent",{
      method:"POST",
      headers:{"content-type":"application/json","x-goog-api-key":key},
      body:JSON.stringify(body)});
@@ -802,8 +831,27 @@ const AI=(()=>{
    const j=await r.json();
    const c=(j.candidates||[])[0];
    const t=(((c||{}).content||{}).parts||[]).map(x=>x.text||"").join("").trim();
-   if(!t){const e=new Error("empty");e.code="empty";throw e;}
+   if(!t){const e=new Error("the model returned nothing");e.code="empty";throw e;}
    return t;
+ }
+ async function gemini(body,model){
+   const key=myKey();
+   if(!key){const e=new Error("no key");e.code="no_key";throw e;}
+   const set=(D.gmodel||"").trim();
+   const tries=model?[model]:(set?[set]:GFALL.slice());
+   let last=null;
+   for(const m of tries){
+     try{
+       const t=await gcall(body,m,key);
+       if(!model&&!set){D.gmodel=m;save();}   // remember whichever worked
+       return t;
+     }catch(e){ last=e; if(e.code!=="model")throw e; }
+   }
+   if(!model&&set){                            // a stored name went stale — clear it and retry once
+     D.gmodel="";save();
+     return gemini(body);
+   }
+   throw last||gerr(404,"no usable model");
  }
  async function viaKey(turns,sys,onText){
    if(prov()==="gemini"){
@@ -832,6 +880,13 @@ const AI=(()=>{
  }
  return{
   async host(){await ready;return !!ns;},
+  async pickModel(){
+    const names=await gmodels();
+    if(!names.length){const e=new Error("this key has no text models enabled");e.code="model";throw e;}
+    const m=gpick(names);
+    D.gmodel=m; await save();
+    return m;
+  },
   async usable(){await ready;return !!ns||!!myKey();},
   async askJSON(prompt,search){
     await ready;
@@ -1297,13 +1352,18 @@ function vProgress(){
     if(!has){msg.textContent="Cleared.";return;}
     msg.textContent="Checking the key…";
     try{
+     let chose="";
+     if(gem&&!D.gmodel){ chose=await AI.pickModel(); }
      await AI.ask([{role:"user",content:"Reply with the single word: ready"}],
        "You are a connection test. Reply with one word.");
-     msg.textContent="Working. Follow-up questions are switched on.";
+     msg.textContent="Working"+((gem&&(chose||D.gmodel))?(", using "+(chose||D.gmodel)):"")+
+       ". Follow-up questions are switched on.";
     }catch(e){
+     const detail=e&&e.message?String(e.message).slice(0,180):"";
      msg.textContent = e&&e.code==="bad_key" ? "That key was rejected — check it and try again."
        : e&&e.code==="rate_limited" ? "Key accepted, but the free tier is busy. Try a question in a minute."
-       : "Saved, but the test call failed. Check the model name, or try again shortly.";
+       : e&&e.code==="model" ? ("No usable model found for this key. "+detail)
+       : ("Saved, but the test call failed. "+detail);
     }
    };
   };
